@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'manual_master = master_capstone.manual_master:main',
             'dummy_task_node = master_capstone.dummy_task_node:main',
+            'master_0 = master_capstone.master_0:main',
         ],
     },
 )
