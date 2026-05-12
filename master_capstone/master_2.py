@@ -15,7 +15,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from ament_index_python.packages import get_package_share_directory
+
 from std_msgs.msg import Bool, String, Int32
+from grasp_msgs.msg import ObjectAlign
 
 
 class Stage2Status(str, Enum):
@@ -28,6 +30,16 @@ class Stage2Status(str, Enum):
 
 
 class Stage2Master(Node):
+    """
+    Stage 2 master for object picking.
+
+    핵심 변경점:
+      - /object_align_result(ObjectAlign)를 subscribe한다.
+      - OBJECT_ALIGN 상태에서 CALI_ZED가 publish한 selected_arm을 저장한다.
+      - /arm_picking_finish true가 들어와 DETECTION_GRASPING으로 넘어갈 때,
+        selected_arm에 따라 SAM3/AnyGrasp/CALI_D405 R 또는 L 노드만 start한다.
+    """
+
     def __init__(self):
         super().__init__("stage2_master")
         self.lock = threading.Lock()
@@ -43,6 +55,14 @@ class Stage2Master(Node):
         self.processes: Dict[str, subprocess.Popen] = {}
         self.launch_requested_nodes: Set[str] = set()
 
+        # Latest ObjectAlign from CALI_ZED.
+        self.last_object_align: Optional[ObjectAlign] = None
+        self.selected_arm: str = ""
+        self.object_align_received: bool = False
+
+        # ============================================================
+        # Parameters
+        # ============================================================
         self.declare_parameter("config_package", "master_capstone")
         self.declare_parameter("item_database_file", "item_database.yaml")
         self.declare_parameter("item_database_path", "")
@@ -54,11 +74,22 @@ class Stage2Master(Node):
         # TRANSIENT_LOCAL start topic을 false로 clear한 뒤, 다음 true가 바로 붙어서 씹히는 것을 막기 위한 대기.
         self.declare_parameter("phase_clear_wait_sec", 0.5)
         self.declare_parameter("prompt_start_wait_sec", 0.3)
+
+        # Test command topics
         self.declare_parameter("cmd_topic", "/master2/cmd")
         self.declare_parameter("item_cmd_topic", "/master2/item")
         self.declare_parameter("status_topic", "/master2/status")
+
+        # ObjectAlign
+        self.declare_parameter("object_align_topic", "/object_align_result")
+        self.declare_parameter("require_object_align_before_detection", True)
+        self.declare_parameter("default_selected_arm", "right")
+
         self.phase_clear_wait_sec = float(self.get_parameter("phase_clear_wait_sec").value)
         self.prompt_start_wait_sec = float(self.get_parameter("prompt_start_wait_sec").value)
+        self.object_align_topic = str(self.get_parameter("object_align_topic").value)
+        self.require_object_align_before_detection = bool(self.get_parameter("require_object_align_before_detection").value)
+        self.default_selected_arm = str(self.get_parameter("default_selected_arm").value).strip().lower()
 
         self.qos_cmd = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -77,11 +108,26 @@ class Stage2Master(Node):
         self._create_start_publishers()
         self._create_finish_subscribers()
 
+        # Target info publishers
         self.pub_target_item_name = self.create_publisher(String, "/target_item_name", self.qos_cmd)
         self.pub_target_aruco_id = self.create_publisher(Int32, "/target_aruco_id", self.qos_cmd)
         self.pub_target_text_prompt = self.create_publisher(String, "/target_text_prompt", self.qos_cmd)
-        self.pub_sam3_text_prompt = self.create_publisher(String, "/sam3_text_prompt", self.qos_cmd)
+        self.pub_target_shelf_id = self.create_publisher(String, "/target_shelf_id", self.qos_cmd)
         self.pub_target_shelf_layer = self.create_publisher(Int32, "/target_shelf_layer", self.qos_cmd)
+
+        # SAM3 prompt publishers. R/L 분리 노드가 받는 토픽.
+        self.pub_sam3_r_text_prompt = self.create_publisher(String, "/sam3_r_text_prompt", self.qos_cmd)
+        self.pub_sam3_l_text_prompt = self.create_publisher(String, "/sam3_l_text_prompt", self.qos_cmd)
+        # Legacy prompt topic, 기존 공용 SAM3 테스트용으로 유지. R/L 노드에는 필요 없음.
+        self.pub_sam3_text_prompt = self.create_publisher(String, "/sam3_text_prompt", self.qos_cmd)
+
+        # Subscribe ObjectAlign from CALI_ZED.
+        self.sub_object_align = self.create_subscription(
+            ObjectAlign,
+            self.object_align_topic,
+            self._object_align_callback,
+            10,
+        )
 
         # Topic control for testing without keyboard input.
         self.cmd_topic = self.get_parameter("cmd_topic").value
@@ -92,6 +138,7 @@ class Stage2Master(Node):
         self.sub_item_cmd = self.create_subscription(String, self.item_cmd_topic, self._item_topic_callback, self.qos_cmd)
 
         self.get_logger().info("stage2_master started. Type 'help' to see commands.")
+        self.get_logger().info(f"ObjectAlign subscriber enabled: {self.object_align_topic} grasp_msgs/ObjectAlign")
         self.get_logger().info(f"Topic command enabled: {self.cmd_topic} std_msgs/String")
         self.get_logger().info(f"Topic item command enabled: {self.item_cmd_topic} std_msgs/String")
         self.get_logger().info(f"Status publisher enabled: {self.status_topic} std_msgs/String")
@@ -149,11 +196,16 @@ class Stage2Master(Node):
     def _build_start_topics(self) -> Dict[str, str]:
         return {
             "aruco_zed_start": "/aruco_zed_start",
-            "sam3_start": "/sam3_start",
-            "anygrasp_start": "/anygrasp_start",
-            "cali_d405_start": "/cali_d405_start",
             "arm_picking_start": "/arm_picking_start",
             "gripper_start": "/gripper_start",
+
+            # R/L perception pipeline
+            "sam3_r_start": "/sam3_r_start",
+            "anygrasp_r_start": "/anygrasp_r_start",
+            "cali_d405_r_start": "/cali_d405_r_start",
+            "sam3_l_start": "/sam3_l_start",
+            "anygrasp_l_start": "/anygrasp_l_start",
+            "cali_d405_l_start": "/cali_d405_l_start",
         }
 
     def _build_finish_topics(self) -> Dict[str, str]:
@@ -168,9 +220,49 @@ class Stage2Master(Node):
     def _create_finish_subscribers(self):
         for key, topic in self.finish_topics.items():
             self.finish_subscribers[key] = self.create_subscription(
-                Bool, topic, lambda msg, finish_key=key: self._finish_callback(finish_key, msg), self.qos_cmd
+                Bool,
+                topic,
+                lambda msg, finish_key=key: self._finish_callback(finish_key, msg),
+                self.qos_cmd,
             )
             self.get_logger().info(f"Finish subscriber created: {topic}")
+
+    # ============================================================
+    # ObjectAlign callback
+    # ============================================================
+    def _object_align_callback(self, msg: ObjectAlign):
+        arm = (msg.selected_arm or "").strip().lower()
+        if arm not in ("left", "right"):
+            self.get_logger().warn(f"[ObjectAlign RX] invalid selected_arm='{msg.selected_arm}'. Ignored for R/L selection.")
+            return
+
+        with self.lock:
+            # OBJECT_ALIGN 상태에서 들어온 결과만 R/L 결정에 사용한다.
+            # 테스트 편의를 위해 OBJECT_ALIGN이 아니어도 저장은 하되 warning만 찍는다.
+            stg, sts = self.stage, self.status
+            self.last_object_align = msg
+            self.selected_arm = arm
+            self.object_align_received = True
+            label = msg.label
+            prompt = msg.text_prompt
+            shelf_id = getattr(msg, "shelf_id", "")
+            shelf_layer = getattr(msg, "shelf_layer", 0)
+
+        if stg != "2" or sts != Stage2Status.OBJECT_ALIGN.value:
+            self.get_logger().warn(
+                f"[ObjectAlign RX] received in {stg}/{sts}. Stored selected_arm={arm}, but normally expected in OBJECT_ALIGN."
+            )
+
+        self._set_state(
+            event=(
+                f"ObjectAlign RX: arm={arm}, label={label}, prompt={prompt}, "
+                f"shelf_id={shelf_id}, shelf_layer={shelf_layer}"
+            )
+        )
+        self.get_logger().info(
+            f"[ObjectAlign RX] selected_arm={arm}, label={label}, prompt={prompt}, "
+            f"shelf_id={shelf_id}, shelf_layer={shelf_layer}"
+        )
 
     # ============================================================
     # Dashboard
@@ -200,18 +292,23 @@ class Stage2Master(Node):
                     f" / item_key={self.current_item.get('item_key', '-')}"
                     f" / aruco_id={self.current_item.get('aruco_id', '-')}"
                     f" / prompt={self.current_item.get('text_prompt', '-')}"
+                    f" / shelf_id={self.current_item.get('shelf_id', '-')}"
                     f" / shelf_layer={self.current_item.get('shelf_layer', '-')}"
                 )
+            selected_arm_text = self.selected_arm if self.selected_arm else "-"
+            object_align_text = "RX" if self.object_align_received else "-"
             return (
                 "\n============================================================\n"
                 " STAGE MASTER : STAGE 2 MASTER ONLY\n"
                 f" STAGE        : {self.stage}\n"
                 f" STATUS       : {self.status}\n"
                 " STATUS FLOW  : INIT2 -> OBJECT_ALIGN -> DETECTION_GRASPING -> GRIPPER_ACTIVATE -> INIT3\n"
-                " PRE-LAUNCHED : SAM3, ANYGRASP, ARUCO_ZED, CALI_ZED, CALI_D405, ARM_PICKING\n"
+                " PRE-LAUNCHED : SAM3_R/L, ANYGRASP_R/L, ARUCO_ZED, CALI_ZED, CALI_D405_R/L, ARM_PICKING\n"
                 " MASTER LAUNCH: GRIPPER only\n"
                 f" START2 DONE  : {self.stage2_started}\n"
                 f" CURRENT ITEM : {item_text}\n"
+                f" SELECTED ARM : {selected_arm_text}\n"
+                f" OBJECTALIGN  : {object_align_text}\n"
                 f" LAUNCH REQ   : {launch_req}\n"
                 f" FINISH RX    : {finishes}\n"
                 f" EVENT        : {self.last_event}\n"
@@ -271,14 +368,21 @@ class Stage2Master(Node):
         elif cmd == "kill_all":
             self._shutdown_all_processes()
         elif cmd.startswith("force_status "):
-            # Debug-only: directly force the status string.
-            # Example: force_status INIT2
             status = raw.split(" ", 1)[1].strip().upper()
             valid = [x.value for x in Stage2Status]
             if status in valid:
                 self._set_state(stage="2" if status != Stage2Status.INIT3.value else "3", status=status, event=f"force_status by topic: {status}")
             else:
                 self._set_state(event=f"invalid force_status by topic: {status}")
+        elif cmd.startswith("force_arm "):
+            arm = raw.split(" ", 1)[1].strip().lower()
+            if arm in ("left", "right"):
+                with self.lock:
+                    self.selected_arm = arm
+                    self.object_align_received = True
+                self._set_state(event=f"force_arm by topic: {arm}")
+            else:
+                self._set_state(event=f"invalid force_arm by topic: {arm}")
         else:
             with self.lock:
                 current_status = self.status
@@ -333,6 +437,15 @@ class Stage2Master(Node):
                 show = False
             elif cmd == "kill_all":
                 self._shutdown_all_processes()
+            elif cmd.startswith("force_arm "):
+                arm = raw.split(" ", 1)[1].strip().lower()
+                if arm in ("left", "right"):
+                    with self.lock:
+                        self.selected_arm = arm
+                        self.object_align_received = True
+                    self._set_state(event=f"force_arm command: {arm}")
+                else:
+                    self._set_state(event=f"invalid force_arm command: {arm}")
             else:
                 with self.lock:
                     current_status = self.status
@@ -389,6 +502,10 @@ class Stage2Master(Node):
 
     def _enter_object_align(self):
         self._clear_finish_received()
+        with self.lock:
+            self.last_object_align = None
+            self.selected_arm = ""
+            self.object_align_received = False
         self._set_state(stage="2", status=Stage2Status.OBJECT_ALIGN.value, event="INIT2 -> OBJECT_ALIGN")
         print("\n[STATUS MOVE] INIT2 -> OBJECT_ALIGN")
         self._publish_target_info()
@@ -398,31 +515,64 @@ class Stage2Master(Node):
     def _finish_object_align(self, finish_key: str):
         with self.lock:
             self.finish_received.add(finish_key)
+            selected_arm = self.selected_arm
+            got_align = self.object_align_received
+
+        if self.require_object_align_before_detection and not got_align:
+            print("[WARN] arm_picking_finish received, but ObjectAlign has not been received yet. Stay in OBJECT_ALIGN.")
+            self._set_state(event="arm_picking_finish ignored: waiting ObjectAlign")
+            return
+
+        if selected_arm not in ("left", "right"):
+            if self.default_selected_arm in ("left", "right") and not self.require_object_align_before_detection:
+                selected_arm = self.default_selected_arm
+                with self.lock:
+                    self.selected_arm = selected_arm
+                print(f"[WARN] selected_arm missing. fallback default_selected_arm={selected_arm}")
+            else:
+                print(f"[WARN] selected_arm invalid or missing: '{selected_arm}'. Stay in OBJECT_ALIGN.")
+                self._set_state(event="arm_picking_finish ignored: selected_arm missing")
+                return
+
         self._publish_start("aruco_zed_start", False)
         self._publish_start("arm_picking_start", False)
         print(f"\n[WAIT] clear wait {self.phase_clear_wait_sec:.2f}s before DETECTION_GRASPING")
         time.sleep(self.phase_clear_wait_sec)
-        print("\n[STATUS MOVE] OBJECT_ALIGN -> DETECTION_GRASPING")
+        print(f"\n[STATUS MOVE] OBJECT_ALIGN -> DETECTION_GRASPING | selected_arm={selected_arm}")
         self._enter_detection_grasping()
 
     def _enter_detection_grasping(self):
         self._clear_finish_received()
-        self._set_state(stage="2", status=Stage2Status.DETECTION_GRASPING.value, event="OBJECT_ALIGN -> DETECTION_GRASPING")
+        with self.lock:
+            selected_arm = self.selected_arm
+        if selected_arm not in ("left", "right"):
+            self._set_state(status=Stage2Status.FAILED.value, event=f"cannot enter DETECTION_GRASPING: invalid selected_arm={selected_arm}")
+            print(f"[ERROR] cannot enter DETECTION_GRASPING: invalid selected_arm={selected_arm}")
+            return
+
+        self._set_state(stage="2", status=Stage2Status.DETECTION_GRASPING.value, event=f"OBJECT_ALIGN -> DETECTION_GRASPING selected_arm={selected_arm}")
         self._publish_target_info()
-        self._publish_sam3_prompt()
+        self._publish_sam3_prompt_for_arm(selected_arm)
         print(f"\n[WAIT] prompt wait {self.prompt_start_wait_sec:.2f}s before start topics")
         time.sleep(self.prompt_start_wait_sec)
-        self._publish_start("sam3_start", True)
-        self._publish_start("anygrasp_start", True)
-        self._publish_start("cali_d405_start", True)
+
+        if selected_arm == "right":
+            self._publish_start("sam3_r_start", True)
+            self._publish_start("anygrasp_r_start", True)
+            self._publish_start("cali_d405_r_start", True)
+        else:
+            self._publish_start("sam3_l_start", True)
+            self._publish_start("anygrasp_l_start", True)
+            self._publish_start("cali_d405_l_start", True)
+
         self._publish_start("arm_picking_start", True)
 
     def _finish_detection_grasping(self, finish_key: str):
         with self.lock:
             self.finish_received.add(finish_key)
-        self._publish_start("sam3_start", False)
-        self._publish_start("anygrasp_start", False)
-        self._publish_start("cali_d405_start", False)
+            selected_arm = self.selected_arm
+
+        self._clear_perception_start_for_arm(selected_arm)
         self._publish_start("arm_picking_start", False)
         print(f"\n[WAIT] clear wait {self.phase_clear_wait_sec:.2f}s before GRIPPER_ACTIVATE")
         time.sleep(self.phase_clear_wait_sec)
@@ -448,6 +598,10 @@ class Stage2Master(Node):
         self._clear_finish_received()
         self.current_item = None
         self.current_item_input = ""
+        with self.lock:
+            self.last_object_align = None
+            self.selected_arm = ""
+            self.object_align_received = False
         self._set_state(stage="2", status=Stage2Status.INIT2.value, event="stage2 reset to INIT2")
         print("[RESET] Stage 2 reset to STAGE=2 STATUS=INIT2")
 
@@ -470,6 +624,23 @@ class Stage2Master(Node):
         for key in self.start_topics.keys():
             self._publish_start(key, False)
 
+    def _clear_perception_start_for_arm(self, arm: str):
+        if arm == "right":
+            self._publish_start("sam3_r_start", False)
+            self._publish_start("anygrasp_r_start", False)
+            self._publish_start("cali_d405_r_start", False)
+        elif arm == "left":
+            self._publish_start("sam3_l_start", False)
+            self._publish_start("anygrasp_l_start", False)
+            self._publish_start("cali_d405_l_start", False)
+        else:
+            # 안전상 양쪽 모두 false.
+            for key in [
+                "sam3_r_start", "anygrasp_r_start", "cali_d405_r_start",
+                "sam3_l_start", "anygrasp_l_start", "cali_d405_l_start",
+            ]:
+                self._publish_start(key, False)
+
     def _publish_target_info(self):
         if self.current_item is None:
             return
@@ -477,6 +648,7 @@ class Stage2Master(Node):
         product_name = str(self.current_item.get("product_name", item_id))
         text_prompt = str(self.current_item.get("text_prompt", ""))
         aruco_id = int(self.current_item.get("aruco_id", -1))
+        shelf_id = str(self.current_item.get("shelf_id", ""))
         shelf_layer = int(self.current_item.get("shelf_layer", 0))
 
         m = String(); m.data = product_name if product_name else item_id
@@ -491,17 +663,32 @@ class Stage2Master(Node):
         self.pub_target_text_prompt.publish(p)
         print(f"[PUB] /target_text_prompt std_msgs/String data: '{p.data}'")
 
+        sid = String(); sid.data = shelf_id
+        self.pub_target_shelf_id.publish(sid)
+        print(f"[PUB] /target_shelf_id std_msgs/String data: '{sid.data}'")
+
         l = Int32(); l.data = shelf_layer
         self.pub_target_shelf_layer.publish(l)
         print(f"[PUB] /target_shelf_layer std_msgs/Int32 data: {l.data}")
 
-    def _publish_sam3_prompt(self):
+    def _publish_sam3_prompt_for_arm(self, arm: str):
         if self.current_item is None:
             return
         prompt = str(self.current_item.get("text_prompt", ""))
         m = String(); m.data = prompt
+
+        # legacy도 같이 publish해서 기존 echo/debug와 호환.
         self.pub_sam3_text_prompt.publish(m)
         print(f"[PUB] /sam3_text_prompt std_msgs/String data: '{m.data}'")
+
+        if arm == "right":
+            self.pub_sam3_r_text_prompt.publish(m)
+            print(f"[PUB] /sam3_r_text_prompt std_msgs/String data: '{m.data}'")
+        elif arm == "left":
+            self.pub_sam3_l_text_prompt.publish(m)
+            print(f"[PUB] /sam3_l_text_prompt std_msgs/String data: '{m.data}'")
+        else:
+            print(f"[WARN] cannot publish SAM3 R/L prompt: invalid arm={arm}")
 
     # ============================================================
     # Finish callback
@@ -591,7 +778,12 @@ class Stage2Master(Node):
             print("  - item_database.yaml empty or not loaded")
             return
         for k, v in self.item_db.items():
-            print(f"  {k:<15} product_name={v.get('product_name','-')}, aruco_id={v.get('aruco_id','-')}, text_prompt={v.get('text_prompt','-')}, shelf_layer={v.get('shelf_layer','-')}, aliases={v.get('aliases',[])}")
+            print(
+                f"  {k:<15} product_name={v.get('product_name','-')}, "
+                f"aruco_id={v.get('aruco_id','-')}, text_prompt={v.get('text_prompt','-')}, "
+                f"shelf_id={v.get('shelf_id','-')}, shelf_layer={v.get('shelf_layer','-')}, "
+                f"aliases={v.get('aliases',[])}"
+            )
 
     def _print_topics_and_nodes(self):
         print("\n[Node commands]")
@@ -603,27 +795,33 @@ class Stage2Master(Node):
         print("\n[Finish topics]")
         for k, t in self.finish_topics.items():
             print(f"  {k:<25} -> {t}")
+        print("\n[ObjectAlign]")
+        print(f"  object_align_result     -> {self.object_align_topic} grasp_msgs/ObjectAlign")
         print("\n[Target topics]")
         print("  target_item_name        -> /target_item_name       std_msgs/String")
         print("  target_aruco_id         -> /target_aruco_id        std_msgs/Int32")
         print("  target_text_prompt      -> /target_text_prompt     std_msgs/String")
-        print("  sam3_text_prompt        -> /sam3_text_prompt       std_msgs/String")
+        print("  target_shelf_id         -> /target_shelf_id        std_msgs/String")
         print("  target_shelf_layer      -> /target_shelf_layer     std_msgs/Int32")
+        print("  sam3_r_text_prompt      -> /sam3_r_text_prompt     std_msgs/String")
+        print("  sam3_l_text_prompt      -> /sam3_l_text_prompt     std_msgs/String")
 
     def _print_help(self):
         print("""
 ============================================================
 Stage 2 Master Commands
 ============================================================
-  start2       : gripper node launch only. STATUS remains INIT2.
-  item <name>  : INIT2 -> OBJECT_ALIGN
-  <name>       : same as item <name> in INIT2
-  items        : print item DB
-  status       : dashboard
-  reset/init2  : publish all start topics false and return to INIT2
-  list         : print topics
-  kill_all     : terminate launched gripper process
-  exit/quit/q  : publish all start topics false and shutdown
+  start2           : gripper node launch only. STATUS remains INIT2.
+  item <name>      : INIT2 -> OBJECT_ALIGN
+  <name>           : same as item <name> in INIT2
+  force_arm left   : debug only. set selected_arm=left without ObjectAlign
+  force_arm right  : debug only. set selected_arm=right without ObjectAlign
+  items            : print item DB
+  status           : dashboard
+  reset/init2      : publish all start topics false and return to INIT2
+  list             : print topics
+  kill_all         : terminate launched gripper process
+  exit/quit/q      : publish all start topics false and shutdown
 
 State transitions by /arm_picking_finish true:
   OBJECT_ALIGN        -> DETECTION_GRASPING
@@ -631,7 +829,9 @@ State transitions by /arm_picking_finish true:
   GRIPPER_ACTIVATE   -> INIT3
 
 Important:
-  Because start topics use TRANSIENT_LOCAL, every phase exit publishes false.
+  - OBJECT_ALIGN 상태에서 /object_align_result를 받아 selected_arm을 저장한다.
+  - arm_picking_finish 이후 selected_arm 기준으로 R/L perception 노드 하나만 start한다.
+  - Because start topics use TRANSIENT_LOCAL, every phase exit publishes false.
 ============================================================
 """)
 
