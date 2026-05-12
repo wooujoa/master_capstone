@@ -1,0 +1,29 @@
+metadata:
+  version: 1
+  shelf_layer_rule: "bottom_to_top"
+
+items:
+  coke:
+    item_id: "coke"
+    product_name: "콜라"
+    aliases:
+      - "콜라"
+      - "코카콜라"
+      - "coke"
+      - "cola"
+    aruco_id: 3
+    text_prompt: "coke bottle"
+    shelf_id: "shelf_2"
+    shelf_layer: 1
+
+  apple:
+    item_id: "apple"
+    product_name: "사과"
+    aliases:
+      - "사과"
+      - "apple"
+      - "빨간 사과"
+    aruco_id: 1
+    text_prompt: "apple"
+    shelf_id: "shelf_1"
+    shelf_layer: 2
